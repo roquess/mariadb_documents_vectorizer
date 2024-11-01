@@ -1,0 +1,19 @@
+[package]
+name = "mariadb_documents_vectorizer"
+version = "0.1.0"
+edition = "2021"
+license-file="LICENSE"
+repository="https://github.com/roquess/mariadb_documents_vectorizer"
+
+[dependencies]
+sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "mysql", "uuid"] }
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
+serde = { version = "1.0", features = ["derive"] }
+clap = { version = "4.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+dotenv = "0.15"
+pdf-extract = "0.7"
+thiserror = "1.0"
