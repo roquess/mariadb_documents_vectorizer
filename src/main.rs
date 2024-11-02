@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 use pdf_extract::extract_text;
 use sqlx::Row;
+use rust_bert::pipelines::sentence_embeddings::{SentenceEmbeddingsBuilder, SentenceEmbeddingsModelType};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -43,12 +44,19 @@ pub struct SearchResult {
 
 pub struct App {
     pool: MySqlPool,
+    model: rust_bert::pipelines::sentence_embeddings::SentenceEmbeddingsModel,
 }
 
 impl App {
     pub async fn new(database_url: &str) -> Result<Self> {
         let pool = MySqlPool::connect(database_url).await?;
-        let app = Self { pool };
+        
+        let model = tokio::task::spawn_blocking(|| {
+            SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL12V2)
+                .create_model()
+        }).await??;
+        
+        let app = Self { pool, model };
         app.init_database().await?;
         Ok(app)
     }
@@ -64,9 +72,9 @@ impl App {
                 VECTOR INDEX (embedding)
             )
             "#,
-            )
-            .execute(&self.pool)
-            .await?;
+        )
+        .execute(&self.pool)
+        .await?;
 
         info!("Table structure verified");
         Ok(())
@@ -76,15 +84,15 @@ impl App {
         let content = self.read_file_content(path)?;
         info!("Successfully extracted text from file");
 
-        let embedding = self.generate_embedding(&content)?;
+        let embedding = self.generate_embedding(&content).await?;
 
         let doc = Document {
             name: path.file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string(),
-                description: content,
-                embedding,
+            description: content,
+            embedding,
         };
 
         self.save_document(&doc).await?;
@@ -110,26 +118,12 @@ impl App {
         }
     }
 
-    fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
-        // Basic text vectorization using a simple word frequency approach
-        let words: Vec<&str> = text.split_whitespace().collect();
-        let mut word_count = std::collections::HashMap::new();
+    async fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
+        let text_to_embed = text.to_string();
+        
+        let embeddings = self.model.encode(&[&text_to_embed])?;
 
-        for word in words {
-            *word_count.entry(word.to_lowercase()).or_insert(0) += 1;
-        }
-
-        // Create a simple vector where each index corresponds to a unique word
-        let unique_words: Vec<String> = word_count.keys().cloned().collect();
-        let mut embedding = vec![0.0; unique_words.len()];
-
-        for (i, word) in unique_words.iter().enumerate() {
-            if let Some(&count) = word_count.get(word) {
-                embedding[i] = count as f32; // Using word frequency as the embedding value
-            }
-        }
-
-        Ok(embedding)
+        Ok(embeddings.into_iter().next().unwrap_or_default())
     }
 
     async fn save_document(&self, doc: &Document) -> Result<()> {
@@ -138,12 +132,12 @@ impl App {
             INSERT INTO documents (name, description, embedding)
             VALUES (?, ?, VEC_FromText(?))
             "#,
-            )
-            .bind(&doc.name)
-            .bind(&doc.description)
-            .bind(self.format_vector(&doc.embedding))
-            .execute(&self.pool)
-            .await?;
+        )
+        .bind(&doc.name)
+        .bind(&doc.description)
+        .bind(self.format_vector(&doc.embedding))
+        .execute(&self.pool)
+        .await?;
 
         info!("Saved document: {}", doc.name);
         Ok(())
@@ -151,38 +145,38 @@ impl App {
 
     fn format_vector(&self, vector: &[f32]) -> String {
         format!("[{}]", vector.iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(","))
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(","))
     }
 
     pub async fn search_similar_chunks(&self, query: &str, limit: i32) -> Result<Vec<SearchResult>> {
         info!("Generating embedding for query: {}", query);
-        let query_embedding = self.generate_embedding(query)?;
+        let query_embedding = self.generate_embedding(query).await?;
         let query_vector = self.format_vector(&query_embedding);
 
         let results = sqlx::query(
             r#"
-    SELECT
-        name,
-        description,
-        1 - VEC_DISTANCE(embedding, VEC_FromText(?)) as similarity
-    FROM documents
-    ORDER BY similarity DESC
-    LIMIT ?
-    "#,
-    )
-            .bind(query_vector)
-            .bind(limit)
-            .map(|row: sqlx::mysql::MySqlRow| {
-                SearchResult {
-                    name: row.get("name"),
-                    description: row.get("description"),
-                    similarity: row.get::<Option<f32>, _>("similarity").unwrap_or(0.0), // Handle NULL values
-                }
-            })
+            SELECT
+                name,
+                description,
+                1 - VEC_DISTANCE(embedding, VEC_FromText(?)) as similarity
+            FROM documents
+            ORDER BY similarity DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(query_vector)
+        .bind(limit)
+        .map(|row: sqlx::mysql::MySqlRow| {
+            SearchResult {
+                name: row.get("name"),
+                description: row.get("description"),
+                similarity: row.get::<Option<f32>, _>("similarity").unwrap_or(0.0),
+            }
+        })
         .fetch_all(&self.pool)
-            .await?;
+        .await?;
 
         Ok(results)
     }
@@ -232,4 +226,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
