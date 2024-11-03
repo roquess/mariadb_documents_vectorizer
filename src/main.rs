@@ -50,12 +50,12 @@ pub struct App {
 impl App {
     pub async fn new(database_url: &str) -> Result<Self> {
         let pool = MySqlPool::connect(database_url).await?;
-        
+
         let model = tokio::task::spawn_blocking(|| {
             SentenceEmbeddingsBuilder::remote(SentenceEmbeddingsModelType::AllMiniLmL12V2)
                 .create_model()
         }).await??;
-        
+
         let app = Self { pool, model };
         app.init_database().await?;
         Ok(app)
@@ -67,7 +67,7 @@ impl App {
             r#"
             CREATE TABLE IF NOT EXISTS documents (
                 name VARCHAR(128) NOT NULL,
-                description VARCHAR(2000),
+                description LONGTEXT,
                 embedding BLOB NOT NULL,
                 VECTOR INDEX (embedding)
             )
@@ -80,22 +80,50 @@ impl App {
         Ok(())
     }
 
+    fn split_text_into_chunks(&self, text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut chunks = Vec::new();
+        let mut i = 0;
+
+        while i < words.len() {
+            let end = (i + chunk_size).min(words.len());
+            let chunk = words[i..end].join(" ");
+            chunks.push(chunk);
+
+            i += chunk_size - overlap;
+            if chunk_size <= overlap {
+                i += 1;
+            }
+        }
+
+        chunks
+    }
+
     pub async fn process_file(&self, path: &Path) -> Result<()> {
         let content = self.read_file_content(path)?;
         info!("Successfully extracted text from file");
 
-        let embedding = self.generate_embedding(&content).await?;
+        let filename = path.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
 
-        let doc = Document {
-            name: path.file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-            description: content,
-            embedding,
-        };
+        let chunks = self.split_text_into_chunks(&content, 300, 30);
+        info!("Split text into {} chunks", chunks.len());
 
-        self.save_document(&doc).await?;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let embedding = self.generate_embedding(chunk).await?;
+
+            let doc = Document {
+                name: format!("{}#chunk{}", filename, i + 1),
+                description: chunk.to_string(),
+                embedding,
+            };
+
+            self.save_document(&doc).await?;
+            info!("Saved chunk {} of {}", i + 1, chunks.len());
+        }
+
         info!("Finished processing file: {}", path.display());
         Ok(())
     }
@@ -120,9 +148,7 @@ impl App {
 
     async fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
         let text_to_embed = text.to_string();
-        
         let embeddings = self.model.encode(&[&text_to_embed])?;
-
         Ok(embeddings.into_iter().next().unwrap_or_default())
     }
 
@@ -160,8 +186,9 @@ impl App {
             SELECT
                 name,
                 description,
-                1 - VEC_DISTANCE(embedding, VEC_FromText(?)) as similarity
+                1.0 - (VEC_DISTANCE(embedding, VEC_FromText(?)) / SQRT(768)) as similarity
             FROM documents
+            HAVING similarity > 0.3
             ORDER BY similarity DESC
             LIMIT ?
             "#,
@@ -183,11 +210,17 @@ impl App {
 }
 
 fn print_search_results(results: &[SearchResult]) {
+    if results.is_empty() {
+        println!("\nNo matching documents found.");
+        return;
+    }
+
     println!("\nSearch Results:");
     println!("------------------------");
 
     for (i, result) in results.iter().enumerate() {
         println!("\n{}. Document: {}", i + 1, result.name);
+        println!("Similarity Score: {:.2}%", result.similarity * 100.0);
         println!("Excerpt: {}", truncate_text(&result.description, 200));
         println!("------------------------");
     }
