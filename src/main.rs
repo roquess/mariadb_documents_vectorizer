@@ -16,14 +16,17 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    #[command(about = "Index a document by extracting text and storing its embedding")]
     Index {
-        #[arg(short, long)]
+        #[arg(short, long, help = "Path to the file to be indexed")]
         file: PathBuf,
     },
+    #[command(about = "Search for similar documents based on the query")]
     Search {
-        #[arg(short, long)]
+        #[arg(short, long, help = "The query text for searching")]
         query: String,
-        #[arg(short, long, default_value = "5")]
+        
+        #[arg(short, long, default_value = "5", help = "The number of results to return")]
         limit: i32,
     },
 }
